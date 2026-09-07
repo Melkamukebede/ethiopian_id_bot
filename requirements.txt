@@ -2,3 +2,4 @@ python-telegram-bot==21.6
 pdfplumber==0.11.4
 pymupdf==1.24.11
 Pillow==10.4.0
+python-barcode==0.15.1
