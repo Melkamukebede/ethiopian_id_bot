@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # PASTE YOUR TOKEN FROM BOTFATHER DIRECTLY HERE (between the quotes):
-BOT_TOKEN = "PASTE_YOUR_TOKEN_HERE"
+BOT_TOKEN = "7958183039:AAFWSsZE73QjyT62PX2-b3uOtLRcCsnxTlA"
 
 # Template paths — put your PNGs next to bot.py
 BASE_DIR       = Path(__file__).parent
