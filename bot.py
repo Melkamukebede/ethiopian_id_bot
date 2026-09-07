@@ -33,7 +33,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+# PASTE YOUR TOKEN FROM BOTFATHER DIRECTLY HERE (between the quotes):
+BOT_TOKEN = "7958183039:AAFWSsZE73QjyT62PX2-b3uOtLRcCsnxTlA"
 
 # Template paths — put your PNGs next to bot.py
 BASE_DIR       = Path(__file__).parent
@@ -385,13 +386,6 @@ async def handle_other(update: Update, _: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        raise ValueError(
-            "Set BOT_TOKEN environment variable:\n"
-            "  export BOT_TOKEN='123456:ABCdef...'\n"
-            "  python bot.py"
-        )
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
