@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # PASTE YOUR TOKEN FROM BOTFATHER DIRECTLY HERE (between the quotes):
-BOT_TOKEN = "7958183039:AAFWSsZE73QjyT62PX2-b3uOtLRcCsnxTlA"
+BOT_TOKEN = "PASTE_YOUR_TOKEN_HERE"
 
 # Template paths — put your PNGs next to bot.py
 BASE_DIR       = Path(__file__).parent
@@ -172,7 +172,80 @@ def extract_data(pdf_path: str) -> dict:
         "date_issue":  "",
         "date_exp_et": "",
         "date_exp_en": "",
+        "fin":         "",
     }
+
+
+def extract_dates_from_fayda_image(pdf_path: str) -> dict:
+    """
+    The FAYDA digital copy image embeds the issue/expiry dates as large rotated text
+    on its right vertical strip. We crop that strip, rotate it, and parse the dates
+    using simple regex on the image filename/text — no OCR library needed since
+    pdfplumber can read the text from the same page region.
+    """
+    import pdfplumber, re
+    result = {"date_issue": "", "date_exp_et": "", "date_exp_en": "", "fin": ""}
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            # Extract ALL words across the whole page including rotated elements
+            page = pdf.pages[0]
+            words = page.extract_words(keep_blank_chars=False)
+            texts = [w["text"] for w in words]
+            full  = " ".join(texts)
+
+            # All dd/mm/yyyy dates — first = issue, second = ET expiry
+            all_dmy = re.findall(r"(\d{2}/\d{2}/20\d{2})", full)
+            if len(all_dmy) >= 2:
+                result["date_issue"]  = all_dmy[0]
+                result["date_exp_et"] = all_dmy[1]
+            elif len(all_dmy) == 1:
+                result["date_issue"]  = all_dmy[0]
+
+            # Gregorian expiry: yyyy/Mon/dd  e.g. "2034/Sep/05"
+            exp_greg = re.findall(r"(20\d{2}/[A-Za-z]{3}/\d{2})", full)
+            if exp_greg:
+                result["date_exp_en"] = exp_greg[-1]  # last one = expiry
+
+            # FIN number: "2694 3061 3602"
+            fin_m = re.search(r"FIN\s+(\d{4}\s+\d{4}\s+\d{4})", full)
+            if fin_m:
+                result["fin"] = fin_m.group(1)
+
+    except Exception as e:
+        logger.warning("Date extraction from FAYDA image failed: %s", e)
+
+    # Fallback: extract from the FAYDA copy image strip using pixel crop
+    if not result["date_issue"] or not result["date_exp_et"]:
+        try:
+            doc = pymupdf.open(pdf_path)
+            imgs = doc[0].get_images(full=True)
+            # Image index 2 or 3 is the FAYDA digital copy (large 1968×3150)
+            for idx in range(len(imgs)):
+                raw = doc.extract_image(imgs[idx][0])
+                if raw["width"] > 1500 and raw["height"] > 2000:
+                    fayda_img = Image.open(io.BytesIO(raw["image"]))
+                    W, H = fayda_img.size
+                    # Crop right vertical strip where dates are printed
+                    strip = fayda_img.crop((int(W * 0.90), 0, W, int(H * 0.55)))
+                    strip_rot = strip.rotate(-90, expand=True)
+                    # Convert to grayscale and threshold for better text reading
+                    strip_gray = strip_rot.convert("L")
+                    # Try to read text via pytesseract if available
+                    try:
+                        import pytesseract
+                        text = pytesseract.image_to_string(strip_gray, config="--psm 7")
+                        dates = re.findall(r"\d{2}/\d{2}/20\d{2}", text)
+                        greg  = re.findall(r"20\d{2}/[A-Za-z]{3}/\d{2}", text)
+                        if dates: result["date_issue"]  = dates[0]
+                        if len(dates) > 1: result["date_exp_et"] = dates[1]
+                        if greg:  result["date_exp_en"] = greg[0]
+                    except ImportError:
+                        pass
+                    break
+        except Exception as e:
+            logger.warning("FAYDA image strip extraction failed: %s", e)
+
+    return result
 
 
 def extract_images(pdf_path: str) -> tuple:
@@ -235,97 +308,127 @@ def _put(card: Image.Image, img: Image.Image, xy: tuple, size: tuple) -> None:
         card.paste(resized, xy)
 
 
+def _draw_mixed(draw: ImageDraw.Draw, x: int, y: int,
+                am: str, en: str, size: int, fill=C_DARK) -> None:
+    """
+    Draw Amharic text then Latin text side-by-side on the same baseline.
+    Uses separate fonts so both scripts render correctly — avoids □ boxes.
+    """
+    f_am = font(size, bold=True,  ethiopic=True)
+    f_en = font(size, bold=True,  ethiopic=False)
+    draw.text((x, y), am, font=f_am, fill=fill)
+    am_w = int(draw.textlength(am, font=f_am))
+    draw.text((x + am_w + 10, y), f"| {en}", font=f_en, fill=fill)
+
+
 def render_front(data: dict, photo: Image.Image | None,
                  qr: Image.Image | None = None) -> Image.Image:
-    """Compose the front face of the ID card — pixel-perfect match to sample."""
+    """Compose the front face — pixel-perfect match to sample."""
     card = Image.open(TEMPLATE_FRONT).convert("RGBA")
     draw = ImageDraw.Draw(card)
 
-    f_eth = font(22, bold=True,  ethiopic=True)
-    f_lat = font(17, bold=False, ethiopic=False)
-    f_val = font(16, bold=True,  ethiopic=False)
-    f_doi = font(12, bold=False, ethiopic=False)
+    # ── Fonts ─────────────────────────────────────────────────────────────────
+    f_name_am  = font(24, bold=True,  ethiopic=True)   # Amharic name large
+    f_name_en  = font(18, bold=False, ethiopic=False)  # English name
+    f_val      = font(17, bold=True,  ethiopic=False)  # data values (dates)
+    f_doi      = font(11, bold=False, ethiopic=False)  # date-of-issue strip
 
-    # ── Large portrait (left column) ─────────────────────────────────────────
+    # ── Large portrait (left column, below header, above barcode) ───────────────
+    # Sample: photo fills x≈8..205, y≈98..480 (stops before bottom strip)
     if photo:
-        _put(card, photo, (28, 108), (202, 322))
+        _put(card, photo, (10, 98), (190, 385))
 
-    # ── Date of Issue (left vertical strip) ──────────────────────────────────
-    if data.get("date_issue"):
-        draw.text((7, 200), data["date_issue"], font=f_doi, fill=C_DARK)
+    # ── Date of Issue — rotated 90° on the narrow left strip ─────────────────
+    doi = data.get("date_issue", "")
+    if doi:
+        doi_img = Image.new("RGBA", (220, 14), (0, 0, 0, 0))
+        doi_draw = ImageDraw.Draw(doi_img)
+        doi_draw.text((0, 0), doi, font=f_doi, fill=C_DARK)
+        doi_rot = doi_img.rotate(90, expand=True)   # now 14 wide × 220 tall
+        card.paste(doi_rot, (3, 190), doi_rot)
 
-    # ── Full name ─────────────────────────────────────────────────────────────
-    draw.text((258, 178), data["name_am"], font=f_eth, fill=C_DARK)
-    draw.text((258, 210), data["name_en"], font=f_lat, fill=C_DARK)
+    # ── Amharic full name ─────────────────────────────────────────────────────
+    draw.text((257, 139), data.get("name_am", ""), font=f_name_am, fill=C_DARK)
 
-    # ── Date of Birth (Latin only — avoids Ethiopic width issues) ─────────────
-    dob = f"{data['dob_et']}  |  {data['dob_en']}" if data.get("dob_en") else data.get("dob_et","")
-    draw.text((258, 292), dob, font=f_val, fill=C_DARK)
+    # ── English full name ─────────────────────────────────────────────────────
+    draw.text((257, 173), data.get("name_en", ""), font=f_name_en, fill=C_DARK)
 
-    # ── Sex (Ethiopic am + Latin en side by side) ─────────────────────────────
-    f_sex_am = font(16, bold=True, ethiopic=True)
-    f_sex_en = font(16, bold=True, ethiopic=False)
-    draw.text((258, 358), data["sex_am"], font=f_sex_am, fill=C_DARK)
-    am_w = int(draw.textlength(data["sex_am"], font=f_sex_am))
-    draw.text((258 + am_w + 12, 358), f"| {data['sex_en']}", font=f_sex_en, fill=C_DARK)
+    # ── Date of Birth ─────────────────────────────────────────────────────────
+    dob_et = data.get("dob_et", "")
+    dob_en = data.get("dob_en", "")
+    dob    = f"{dob_et}  |  {dob_en}" if dob_en else dob_et
+    draw.text((257, 269), dob, font=f_val, fill=C_DARK)
+
+    # ── Sex: Ethiopic word + pipe + Latin word ────────────────────────────────
+    _draw_mixed(draw, 257, 353,
+                data.get("sex_am", ""), data.get("sex_en", ""), 17)
 
     # ── Date of Expiry ────────────────────────────────────────────────────────
-    exp = f"{data['date_exp_et']}  |  {data['date_exp_en']}" if data.get("date_exp_en") else data.get("date_exp_et","")
+    exp_et = data.get("date_exp_et", "")
+    exp_en = data.get("date_exp_en", "")
+    exp    = f"{exp_et}  |  {exp_en}" if exp_en else exp_et
     if exp:
-        draw.text((258, 438), exp, font=f_val, fill=C_DARK)
+        draw.text((257, 430), exp, font=f_val, fill=C_DARK)
 
-    # ── FCN card number ───────────────────────────────────────────────────────
+    # ── FCN card number (ካርድ row) ────────────────────────────────────────────
     if data.get("fcn"):
-        draw.text((490, 502), data["fcn"], font=font(15, bold=True), fill=C_DARK)
+        draw.text((393, 500), data["fcn"], font=font(15, bold=True), fill=C_DARK)
 
-    # ── Barcode ───────────────────────────────────────────────────────────────
+    # ── Barcode (spans ቁጥር/FAN rows) ─────────────────────────────────────────
     if data.get("fcn"):
         bc_img = _make_barcode(data["fcn"])
         if bc_img:
-            _put(card, bc_img, (485, 538), (340, 48))
+            _put(card, bc_img, (257, 532), (544, 52))
 
-    # ── Small thumbnail (bottom-right corner) ─────────────────────────────────
+    # ── Small thumbnail (bottom-right, inside card boundary) ──────────────────
     if photo:
-        _put(card, photo, (850, 496), (82, 104))
+        _put(card, photo, (804, 487), (101, 131))
 
     return card.convert("RGB")
 
 
 def render_back(data: dict, photo: Image.Image | None,
                 qr: Image.Image | None = None) -> Image.Image:
-    """Compose the back face of the ID card — pixel-perfect match to sample."""
+    """Compose the back face — pixel-perfect match to sample."""
     card = Image.open(TEMPLATE_BACK).convert("RGBA")
     draw = ImageDraw.Draw(card)
 
-    f_phone  = font(20, bold=True,  ethiopic=False)
-    f_am_lg  = font(19, bold=True,  ethiopic=True)
-    f_en_md  = font(17, bold=False, ethiopic=False)
-    f_fin    = font(14, bold=True,  ethiopic=False)
+    # ── Fonts ─────────────────────────────────────────────────────────────────
+    f_phone = font(21, bold=True,  ethiopic=False)
+    f_am_lg = font(20, bold=True,  ethiopic=True)
+    f_en_lg = font(18, bold=False, ethiopic=False)
+    f_am_md = font(18, bold=True,  ethiopic=True)
+    f_en_md = font(16, bold=False, ethiopic=False)
+    f_fin   = font(15, bold=True,  ethiopic=False)
 
-    # ── Phone ─────────────────────────────────────────────────────────────────
+    # ── Phone number ──────────────────────────────────────────────────────────
     if data.get("phone"):
-        draw.text((28, 36), data["phone"], font=f_phone, fill=C_DARK)
+        draw.text((13, 32), data["phone"], font=f_phone, fill=C_DARK)
 
-    # ── Address block (region / zone / woreda) ────────────────────────────────
-    # Template already prints nationality, we just draw address below ~y=262
-    y = 262
+    # NOTE: Nationality is already printed on the template background
+    # ("ኢትዮጵያዊ | Ethiopian") so we do NOT redraw it here.
+
+    # ── Address block — region / zone / woreda ────────────────────────────────
+    # Each pair: Ethiopic name bold, then English name below
+    y = 255
     for am, en in [
         (data.get("region_am",""), data.get("region_en","")),
         (data.get("zone_am",""),   data.get("zone_en","")),
         (data.get("woreda_am",""), data.get("woreda_en","")),
     ]:
         if am:
-            draw.text((28, y),      am, font=f_am_lg, fill=C_DARK)
-            draw.text((28, y + 28), en, font=f_en_md, fill=C_DARK)
-            y += 62
+            draw.text((13, y),      am, font=f_am_md, fill=C_DARK)
+            draw.text((13, y + 26), en, font=f_en_md, fill=C_DARK)
+            y += 70
 
-    # ── QR code (right white box  x=462, y=4, 572×540) ───────────────────────
+    # ── QR code — fits the white box on right side (x=527,y=8, 512×601) ──────
     if qr:
-        _put(card, qr, (462, 4), (572, 540))
+        _put(card, qr, (527, 8), (512, 601))
 
-    # ── FIN number (bottom left) ──────────────────────────────────────────────
-    if data.get("fin"):
-        draw.text((28, 558), f"FIN  {data['fin']}", font=f_fin, fill=C_DARK)
+    # ── FIN number — bottom left above disclaimer bar ─────────────────────────
+    fin = data.get("fin", "")
+    if fin:
+        draw.text((13, 565), f"FIN  {fin}", font=f_fin, fill=C_DARK)
 
     return card.convert("RGB")
 
@@ -336,6 +439,8 @@ def build_id_card(pdf_path: str) -> tuple[bytes, bytes]:
     Returns (front_jpeg_bytes, back_jpeg_bytes).
     """
     data           = extract_data(pdf_path)
+    date_info      = extract_dates_from_fayda_image(pdf_path)
+    data.update({k: v for k, v in date_info.items() if v})  # merge non-empty
     portrait, qr   = extract_images(pdf_path)
 
     front_img = render_front(data, portrait, qr)
