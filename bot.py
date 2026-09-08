@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # PASTE YOUR TOKEN FROM BOTFATHER DIRECTLY HERE (between the quotes):
-BOT_TOKEN = "7958183039:AAFWSsZE73QjyT62PX2-b3uOtLRcCsnxTlA"
+BOT_TOKEN = "PASTE_YOUR_TOKEN_HERE"
 
 # Template paths — put your PNGs next to bot.py
 BASE_DIR       = Path(__file__).parent
@@ -178,72 +178,64 @@ def extract_data(pdf_path: str) -> dict:
 
 def extract_dates_from_fayda_image(pdf_path: str) -> dict:
     """
-    The FAYDA digital copy image embeds the issue/expiry dates as large rotated text
-    on its right vertical strip. We crop that strip, rotate it, and parse the dates
-    using simple regex on the image filename/text — no OCR library needed since
-    pdfplumber can read the text from the same page region.
+    Extract issue/expiry dates from the FAYDA digital copy strip.
+    The dates appear as large rotated text on the right edge of the PDF page.
+    Strategy: render the page as a high-res image, crop the date strip,
+    rotate it, OCR with tesseract, parse with regex.
     """
-    import pdfplumber, re
     result = {"date_issue": "", "date_exp_et": "", "date_exp_en": "", "fin": ""}
     try:
+        # Render full page at 3× zoom (≈216 DPI)
+        doc  = pymupdf.open(pdf_path)
+        page = doc[0]
+        pix  = page.get_pixmap(matrix=pymupdf.Matrix(3, 3))
+        page_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        W, H = page_img.size
+
+        # Crop the right-edge vertical strip where the date text lives
+        strip = page_img.crop((int(W * 0.89), int(H * 0.04), W, int(H * 0.46)))
+        strip_rot = strip.rotate(-90, expand=True)
+
+        # Upscale and threshold for cleaner OCR
+        sw, sh = strip_rot.size
+        big  = strip_rot.resize((sw * 3, sh * 3), Image.LANCZOS)
+        gray = big.convert("L")
+        bw   = gray.point(lambda p: 255 if p > 155 else 0)
+
+        # OCR — allow digits, slashes, month abbreviations, pipe and spaces
+        import pytesseract
+        text = pytesseract.image_to_string(
+            bw,
+            config="--psm 7 -c tessedit_char_whitelist="
+                   "0123456789/|SepAugJanFebMarAprMayJunJulOctNovDec "
+        )
+
+        # Fix common misreads (spaced digits font confuses tesseract)
+        text = text.replace("Q", "0").replace("q", "0").replace("O", "0")
+        text = text.replace("l", "1").replace("I", "1")
+
+        # Issue date: dd/mm/yyyy
+        dmy = re.findall(r"(\d{2}/\d{2}/20\d{2})", text)
+        if dmy:
+            result["date_issue"] = dmy[0]
+        if len(dmy) > 1:
+            result["date_exp_et"] = dmy[1]
+
+        # Expiry Gregorian: yyyy/Mon/dd  e.g. "2026/Sep/05"
+        greg = re.findall(r"(20\d{2}/[A-Za-z]{3}/\d{2})", text)
+        if greg:
+            result["date_exp_en"] = greg[-1]
+
+        # FIN — search full page text
         with pdfplumber.open(pdf_path) as pdf:
-            # Extract ALL words across the whole page including rotated elements
-            page = pdf.pages[0]
-            words = page.extract_words(keep_blank_chars=False)
-            texts = [w["text"] for w in words]
-            full  = " ".join(texts)
-
-            # All dd/mm/yyyy dates — first = issue, second = ET expiry
-            all_dmy = re.findall(r"(\d{2}/\d{2}/20\d{2})", full)
-            if len(all_dmy) >= 2:
-                result["date_issue"]  = all_dmy[0]
-                result["date_exp_et"] = all_dmy[1]
-            elif len(all_dmy) == 1:
-                result["date_issue"]  = all_dmy[0]
-
-            # Gregorian expiry: yyyy/Mon/dd  e.g. "2034/Sep/05"
-            exp_greg = re.findall(r"(20\d{2}/[A-Za-z]{3}/\d{2})", full)
-            if exp_greg:
-                result["date_exp_en"] = exp_greg[-1]  # last one = expiry
-
-            # FIN number: "2694 3061 3602"
+            words = pdf.pages[0].extract_words(keep_blank_chars=False)
+            full  = " ".join(w["text"] for w in words)
             fin_m = re.search(r"FIN\s+(\d{4}\s+\d{4}\s+\d{4})", full)
             if fin_m:
                 result["fin"] = fin_m.group(1)
 
     except Exception as e:
-        logger.warning("Date extraction from FAYDA image failed: %s", e)
-
-    # Fallback: extract from the FAYDA copy image strip using pixel crop
-    if not result["date_issue"] or not result["date_exp_et"]:
-        try:
-            doc = pymupdf.open(pdf_path)
-            imgs = doc[0].get_images(full=True)
-            # Image index 2 or 3 is the FAYDA digital copy (large 1968×3150)
-            for idx in range(len(imgs)):
-                raw = doc.extract_image(imgs[idx][0])
-                if raw["width"] > 1500 and raw["height"] > 2000:
-                    fayda_img = Image.open(io.BytesIO(raw["image"]))
-                    W, H = fayda_img.size
-                    # Crop right vertical strip where dates are printed
-                    strip = fayda_img.crop((int(W * 0.90), 0, W, int(H * 0.55)))
-                    strip_rot = strip.rotate(-90, expand=True)
-                    # Convert to grayscale and threshold for better text reading
-                    strip_gray = strip_rot.convert("L")
-                    # Try to read text via pytesseract if available
-                    try:
-                        import pytesseract
-                        text = pytesseract.image_to_string(strip_gray, config="--psm 7")
-                        dates = re.findall(r"\d{2}/\d{2}/20\d{2}", text)
-                        greg  = re.findall(r"20\d{2}/[A-Za-z]{3}/\d{2}", text)
-                        if dates: result["date_issue"]  = dates[0]
-                        if len(dates) > 1: result["date_exp_et"] = dates[1]
-                        if greg:  result["date_exp_en"] = greg[0]
-                    except ImportError:
-                        pass
-                    break
-        except Exception as e:
-            logger.warning("FAYDA image strip extraction failed: %s", e)
+        logger.warning("Date extraction failed: %s", e)
 
     return result
 
