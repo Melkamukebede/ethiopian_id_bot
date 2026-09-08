@@ -1,0 +1,2 @@
+[phases.setup]
+aptPkgs = ["fonts-noto-core", "fonts-noto-extra", "tesseract-ocr"]
